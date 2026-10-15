@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Quét Hóa Đơn</string>
+    <string name="title_so_don">Số Đơn Đặt Hàng</string>
+    <string name="title_so_lenh">Số Lệnh Giao Hàng</string>
+    <string name="title_tuyen">Tuyến Đường</string>
+    <string name="title_po">Mã PO</string>
+    <string name="btn_copy">Copy</string>
+    <string name="not_scanned">Chưa quét</string>
+</resources>
