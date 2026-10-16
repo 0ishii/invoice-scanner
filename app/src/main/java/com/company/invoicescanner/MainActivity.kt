@@ -7,6 +7,8 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Matrix
+import android.media.ExifInterface
 import android.os.Bundle
 import android.view.View
 import android.widget.Button
@@ -21,9 +23,12 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.google.android.material.floatingactionbutton.FloatingActionButton
 import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.TextRecognizer
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import java.io.File
+import java.text.Normalizer
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.ExecutorService
@@ -50,6 +55,15 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val REQUEST_CODE_PERMISSIONS = 10
         private val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA)
+    }
+
+    data class ExtractedInvoice(
+        val orderNumber: String = "",
+        val deliveryNumber: String = "",
+        val routeNumber: String = ""
+    ) {
+        fun hasAny() = orderNumber.isNotEmpty() || deliveryNumber.isNotEmpty() || routeNumber.isNotEmpty()
+        fun isComplete() = orderNumber.isNotEmpty() && deliveryNumber.isNotEmpty() && routeNumber.isNotEmpty()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -140,77 +154,235 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * Đọc metadata EXIF để xác định góc xoay thực tế của cảm biến Camera
+     */
+    private fun getExifRotation(file: File): Int {
+        return try {
+            val exif = ExifInterface(file.absolutePath)
+            when (exif.getAttributeInt(
+                ExifInterface.TAG_ORIENTATION,
+                ExifInterface.ORIENTATION_NORMAL
+            )) {
+                ExifInterface.ORIENTATION_ROTATE_90 -> 90
+                ExifInterface.ORIENTATION_ROTATE_180 -> 180
+                ExifInterface.ORIENTATION_ROTATE_270 -> 270
+                else -> 0
+            }
+        } catch (e: Exception) {
+            0
+        }
+    }
+
+    /**
+     * Xoay Bitmap về hướng chuẩn thẳng đứng (Upright)
+     */
+    private fun loadUprightBitmap(file: File): Bitmap {
+        val bitmap = BitmapFactory.decodeFile(file.absolutePath)
+        val rotation = getExifRotation(file)
+        if (rotation == 0) return bitmap
+        val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
+        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+    }
+
+    private fun rotateBitmap(bitmap: Bitmap, degrees: Float): Bitmap {
+        if (degrees == 0f) return bitmap
+        val matrix = Matrix().apply { postRotate(degrees) }
+        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+    }
+
+    /**
+     * Bỏ dấu tiếng Việt để so khớp nhãn chính xác tuyệt đối
+     */
+    private fun removeVietnameseAccents(str: String): String {
+        val nfd = Normalizer.normalize(str, Normalizer.Form.NFD)
+        val pattern = Pattern.compile("\\p{InCombiningDiacriticalMarks}+")
+        return pattern.matcher(nfd).replaceAll("").replace('đ', 'd').replace('Đ', 'D')
+    }
+
+    /**
+     * Chuẩn hóa lỗi ký tự thường gặp trong OCR in kim / chụp màn hình:
+     * Chữ 'O', 'o', 'D', 'Q' nhầm thành số '0'
+     * Chữ 'I', 'l', '|' nhầm thành số '1'
+     * Chữ 'B' nhầm thành số '8'
+     */
+    private fun cleanOcrDigits(raw: String): String {
+        return raw.replace('O', '0')
+            .replace('o', '0')
+            .replace('D', '0')
+            .replace('Q', '0')
+            .replace('I', '1')
+            .replace('l', '1')
+            .replace('|', '1')
+            .replace('B', '8')
+            .replace('Z', '2')
+            .replace('S', '5')
+            .replace('s', '5')
+    }
+
+    /**
+     * Bóc tách thông tin hóa đơn từ dữ liệu Text Blocks của ML Kit
+     * Hỗ trợ layout 2 cột (Nhãn bên trái, Số bên phải) thông qua tọa độ không gian Y
+     */
+    private fun parseInvoiceFromVisionText(visionText: Text): ExtractedInvoice {
+        var orderNumber = ""
+        var deliveryNumber = ""
+        var routeNumber = ""
+
+        val allLines = visionText.textBlocks.flatMap { it.lines }
+
+        // Helper để tìm các text cùng hàng ngang (Y-axis tolerance) sang bên phải
+        fun findHorizontallyAlignedLines(targetLine: Text.Line): List<Text.Line> {
+            val targetBox = targetLine.boundingBox ?: return emptyList()
+            val targetCenterY = targetBox.centerY()
+            val targetHeight = targetBox.height().coerceAtLeast(10)
+
+            return allLines.filter { other ->
+                if (other == targetLine) return@filter false
+                val otherBox = other.boundingBox ?: return@filter false
+                val otherCenterY = otherBox.centerY()
+                // Nằm cùng dải tung độ và ở bên phải (hoặc ngay sát)
+                Math.abs(otherCenterY - targetCenterY) <= targetHeight * 1.5 && otherBox.left >= targetBox.left - 50
+            }.sortedBy { it.boundingBox?.left ?: 0 }
+        }
+
+        // 1. Quét theo vị trí tương đối và nhãn dòng
+        for (line in allLines) {
+            val rawText = line.text.trim()
+            val cleanLabel = removeVietnameseAccents(rawText).lowercase()
+            val alignedTexts = findHorizontallyAlignedLines(line).map { it.text }
+            val combinedRow = (listOf(rawText) + alignedTexts).joinToString(" ")
+            val normalizedRowDigits = cleanOcrDigits(combinedRow)
+
+            // Dò Số Đơn Đặt Hàng (SO - Sales Order: 200xxxxxxx)
+            if (cleanLabel.contains("so don") || cleanLabel.contains("don dat") || cleanLabel.contains("don dai") || cleanLabel.contains("dat hang")) {
+                val m = Pattern.compile("\\b(200\\d{7}|\\d{10})\\b").matcher(normalizedRowDigits)
+                if (m.find() && orderNumber.isEmpty()) {
+                    orderNumber = m.group(1) ?: ""
+                }
+            }
+
+            // Dò Số Lệnh Giao Hàng (DO - Delivery Order: 810xxxxxxx, tránh nhầm chữ "phieu xuat kho")
+            if ((cleanLabel.contains("so lenh") || cleanLabel.contains("lenh giao") || cleanLabel.contains("giao hang"))
+                && !cleanLabel.contains("phieu") && !cleanLabel.contains("kiem")) {
+                val m = Pattern.compile("\\b(810\\d{7}|\\d{10})\\b").matcher(normalizedRowDigits)
+                if (m.find() && deliveryNumber.isEmpty()) {
+                    val cand = m.group(1) ?: ""
+                    if (cand != orderNumber) deliveryNumber = cand
+                }
+            }
+
+            // Dò Tuyến Đường (1115xx hoặc số 4-8 chữ số cạnh nhãn "tuyen")
+            if (cleanLabel.contains("tuyen") || cleanLabel.contains("tuyen duong") || cleanLabel.contains("route")) {
+                val mRoute = Pattern.compile("\\b(1115\\d{2}|\\d{4,8})\\b").matcher(normalizedRowDigits)
+                if (mRoute.find() && routeNumber.isEmpty()) {
+                    routeNumber = mRoute.group(1) ?: ""
+                }
+            }
+        }
+
+        // 2. Global Regex Scan trên toàn bộ nội dung ảnh (bất kể nhãn có bị cắt hay không)
+        val fullText = visionText.text
+        val normalizedFullDigits = cleanOcrDigits(fullText)
+
+        // Quét Sales Order (200xxxxxxx)
+        if (orderNumber.isEmpty()) {
+            val m = Pattern.compile("\\b(200\\d{7})\\b").matcher(normalizedFullDigits)
+            if (m.find()) {
+                orderNumber = m.group(1) ?: ""
+            }
+        }
+
+        // Quét Delivery Order (810xxxxxxx)
+        if (deliveryNumber.isEmpty()) {
+            val m = Pattern.compile("\\b(810\\d{7})\\b").matcher(normalizedFullDigits)
+            if (m.find()) {
+                val cand = m.group(1) ?: ""
+                if (cand != orderNumber) deliveryNumber = cand
+            }
+        }
+
+        // Quét Tuyến Đường (1115xx)
+        if (routeNumber.isEmpty()) {
+            val m = Pattern.compile("\\b(1115\\d{2})\\b").matcher(normalizedFullDigits)
+            if (m.find()) {
+                routeNumber = m.group(1) ?: ""
+            }
+        }
+
+        return ExtractedInvoice(orderNumber, deliveryNumber, routeNumber)
+    }
+
+    /**
      * Nhận diện Offline On-Device bằng Google ML Kit
      */
     private fun processImageOnDevice(file: File) {
-        val bitmap = BitmapFactory.decodeFile(file.absolutePath)
-        val image = InputImage.fromBitmap(bitmap, 0)
+        val uprightBitmap = try {
+            loadUprightBitmap(file)
+        } catch (e: Exception) {
+            BitmapFactory.decodeFile(file.absolutePath)
+        }
+
         val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+        val image = InputImage.fromBitmap(uprightBitmap, 0)
 
         recognizer.process(image)
             .addOnSuccessListener { visionText ->
-                progressBar.visibility = View.GONE
-                btnCapture.isEnabled = true
+                val result = parseInvoiceFromVisionText(visionText)
 
-                var orderNumber = ""
-                var deliveryNumber = ""
-                var routeNumber = ""
-
-                val fullText = visionText.text
-                val lines = visionText.textBlocks.flatMap { it.lines }
-
-                // 1. Phân tích từng dòng chữ
-                for (line in lines) {
-                    val txt = line.text.trim()
-                    val lower = txt.lowercase()
-
-                    // Dò Số Đơn Đặt Hàng (Ưu tiên bắt đầu bằng 200...)
-                    if (lower.contains("so don") || lower.contains("don dat") || lower.contains("don dai")) {
-                        val m = Pattern.compile("\\b(200\\d{7}|\\d{10})\\b").matcher(txt)
-                        if (m.find()) orderNumber = m.group(1) ?: ""
+                // Nếu ảnh chưa nhận diện được gì (có thể do chụp ngang hoặc ngược), thử tự động xoay góc để nhận diện
+                if (!result.hasAny()) {
+                    tryRotateAndRetry(uprightBitmap, recognizer, 90f) { retryResult ->
+                        displayResult(retryResult)
                     }
-
-                    // Dò Số Lệnh Giao Hàng (Ưu tiên bắt đầu bằng 810..., tránh nhầm tiêu đề phiếu)
-                    if ((lower.contains("so lenh") || lower.contains("lenh giao")) && !lower.contains("phieu")) {
-                        val m = Pattern.compile("\\b(810\\d{7}|\\d{10})\\b").matcher(txt)
-                        if (m.find()) {
-                            val candidate = m.group(1) ?: ""
-                            if (candidate != orderNumber) deliveryNumber = candidate
-                        }
-                    }
-
-                    // Dò Tuyến Đường
-                    if (lower.contains("tuyen") || lower.contains("tuyen duong")) {
-                        val m = Pattern.compile("\\b(\\d{4,8})\\b").matcher(txt)
-                        if (m.find()) routeNumber = m.group(1) ?: ""
-                    }
+                } else {
+                    displayResult(result)
                 }
-
-                // 2. Fallback regex quét toàn màn hình nếu camera dí quá sát làm đứt dòng nhãn
-                if (orderNumber.isEmpty()) {
-                    val m = Pattern.compile("\\b(200\\d{7})\\b").matcher(fullText)
-                    if (m.find()) orderNumber = m.group(1) ?: ""
-                }
-                if (deliveryNumber.isEmpty()) {
-                    val m = Pattern.compile("\\b(810\\d{7})\\b").matcher(fullText)
-                    if (m.find()) {
-                        val candidate = m.group(1) ?: ""
-                        if (candidate != orderNumber) deliveryNumber = candidate
-                    }
-                }
-
-                // Cập nhật giao diện
-                tvOrderNumber.text = if (orderNumber.isNotEmpty()) orderNumber else "Không tìm thấy"
-                tvDeliveryNumber.text = if (deliveryNumber.isNotEmpty()) deliveryNumber else "Không tìm thấy"
-                tvRoute.text = if (routeNumber.isNotEmpty()) routeNumber else "Không tìm thấy"
-
-                Toast.makeText(this, "Đã nhận diện thành công!", Toast.LENGTH_SHORT).show()
             }
             .addOnFailureListener { e ->
                 progressBar.visibility = View.GONE
                 btnCapture.isEnabled = true
                 Toast.makeText(this, "Nhận diện thất bại: ${e.message}", Toast.LENGTH_SHORT).show()
             }
+    }
+
+    /**
+     * Tự động xoay 90, 180, 270 độ thử lại nếu chưa tìm thấy dữ liệu (Self-Correction Fallback)
+     */
+    private fun tryRotateAndRetry(
+        originalBitmap: Bitmap,
+        recognizer: TextRecognizer,
+        angle: Float,
+        onComplete: (ExtractedInvoice) -> Unit
+    ) {
+        val rotated = rotateBitmap(originalBitmap, angle)
+        val image = InputImage.fromBitmap(rotated, 0)
+        recognizer.process(image)
+            .addOnSuccessListener { visionText ->
+                val res = parseInvoiceFromVisionText(visionText)
+                if (res.hasAny() || angle >= 270f) {
+                    onComplete(res)
+                } else {
+                    tryRotateAndRetry(originalBitmap, recognizer, angle + 90f, onComplete)
+                }
+            }
+            .addOnFailureListener {
+                onComplete(ExtractedInvoice())
+            }
+    }
+
+    private fun displayResult(result: ExtractedInvoice) {
+        progressBar.visibility = View.GONE
+        btnCapture.isEnabled = true
+
+        tvOrderNumber.text = if (result.orderNumber.isNotEmpty()) result.orderNumber else "Không tìm thấy"
+        tvDeliveryNumber.text = if (result.deliveryNumber.isNotEmpty()) result.deliveryNumber else "Không tìm thấy"
+        tvRoute.text = if (result.routeNumber.isNotEmpty()) result.routeNumber else "Không tìm thấy"
+
+        if (result.hasAny()) {
+            Toast.makeText(this, "Đã nhận diện thành công!", Toast.LENGTH_SHORT).show()
+        } else {
+            Toast.makeText(this, "Không tìm thấy thông tin trên hóa đơn. Vui lòng căn chỉnh lại!", Toast.LENGTH_LONG).show()
+        }
     }
 
     /**
